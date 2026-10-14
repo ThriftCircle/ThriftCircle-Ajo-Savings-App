@@ -2343,7 +2343,7 @@ function contributionSetup() {
     ],
     groupDraft.frequency,
     "required",
-  )}${field("Contribution Start Date", "startDate", "date", "", groupDraft.startDate, "required")}</div>${formError}${wizardActions()}</form>`;
+  )}${field("Contribution Start Date", "startDate", "date", "", groupDraft.startDate, "required")}${field("Contribution Deadline", "contributionDeadline", "date", "", groupDraft.contributionDeadline, "required")}</div>${formError}${wizardActions()}</form>`;
 }
 function groupRules() {
   return `${title("Group Rules", "Create clear rules so everyone understands how the group works.")}<form id="group-rules-form"><div class="rules-grid">${select(
@@ -2399,7 +2399,7 @@ function reviewGroup() {
     [
       "Contribution Setup",
       "contribution-setup",
-      `${money(groupDraft.contributionAmount)}<br>${e(groupDraft.frequency)}<br>${e(formatDate(groupDraft.startDate))}`,
+      `${money(groupDraft.contributionAmount)}<br>${e(groupDraft.frequency)}<br>Starts ${e(formatDate(groupDraft.startDate))}<br>Deadline ${e(formatDate(groupDraft.contributionDeadline))}`,
       "calendar",
     ],
     ["Group Rules", "group-rules", "3 Rules", "info"],
@@ -3421,13 +3421,14 @@ document.addEventListener("submit", async (event) => {
       await runMutation(
         async () => {
           const payload = {
-            name: groupDraft.name,
+            groupName: groupDraft.name,
             description: groupDraft.description,
             memberCount: groupDraft.memberCount,
             type: groupDraft.type,
             contributionAmount: groupDraft.contributionAmount,
             frequency: groupDraft.frequency,
             startDate: groupDraft.startDate,
+            contributionDeadline: groupDraft.contributionDeadline,
             payoutMethod: groupDraft.payoutMethod,
             rules: {
               latePaymentDays: groupDraft.latePaymentDays,
