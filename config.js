@@ -1,5 +1,5 @@
 window.THRIFTCIRCLE_CONFIG = Object.freeze({
-  apiBaseUrl: "https://thriftcircle.onrender.com",
+  apiBaseUrl: "https://thriftcircle.onrender.com/api",
   requestTimeout: 20000,
   evidenceField: "receipt",
   termsUrl: "",
