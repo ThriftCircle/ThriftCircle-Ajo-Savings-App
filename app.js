@@ -2263,7 +2263,7 @@ function shell(content) {
 function cycleBar() {
   const c = data.cycle || {};
   const cycleNumber = c.cycleNumber ?? c.number;
-  return `<div class="cycle-bar"><div><h3 class="muted">Current Cycle</h3><strong class="small">${e(c.name || (cycleNumber ? `Cycle ${cycleNumber}` : "Current Cycle"))}</strong></div><div class="cycle-selector"><select id="group-select" aria-label="Savings group">${data.groups.map((g) => `<option value="${e(idOf(g))}" ${idOf(g) === groupId ? "selected" : ""}>${e(preview && idOf(g) === "family" ? "My Family Ajo" : g.name)}</option>`).join("")}</select><span class="row small">${icon("calendar")} ${e(cycleNumber ? `Cycle ${cycleNumber}` : c.status || "No active cycle")}</span></div></div>`;
+  return `<div class="cycle-bar"><div><h3 class="muted">Current Cycle</h3><strong class="small">${e(c.name || (cycleNumber ? `Cycle ${cycleNumber}` : "Current Cycle"))}</strong></div><div class="cycle-selector"><select id="group-select" aria-label="Savings group">${data.groups.map((g) => `<option value="${e(idOf(g))}" ${idOf(g) === groupId ? "selected" : ""}>${e(preview && idOf(g) === "family" ? "My Family Ajo" : g.name)}</option>`).join("")}</select><span class="row small">${icon("calendar")} ${e(cycleNumber ? `Cycle ${cycleNumber}` : c.status || "Waiting for member approval")}</span></div></div>`;
 }
 function recentPayments(history = false) {
   const g = group();
@@ -2613,7 +2613,7 @@ function paymentReviews() {
 }
 function payouts() {
   const order = data.payoutOrder || [];
-  return `${title("Payout Schedule")}<a href="#group-details" class="card row" style="color:inherit"><span class="avatar">${icon("groups")}</span><div style="flex:1"><h3>${e(group()?.name || "Savings Group")}</h3><p class="muted small">${e(data.cycle?.cycleNumber ? `Cycle ${data.cycle.cycleNumber}` : "No active cycle")}</p></div>${icon("arrow")}</a><div class="row between"><h3>Recipient Order (${order.length} Members)</h3>${user?.role !== "MEMBER" ? link("payout-order", "Manage Order", "text-btn") : ""}</div><div class="payout-list">${order.map((member, i) => `<div class="payout-card"><span class="avatar">${member.position || i + 1}</span><div class="grow"><h3>${e(memberName(member))}</h3><p class="muted">${e(member.role || "member")}</p></div>${pill(member.status)}</div>`).join("") || empty("No payout recipients", "Approved group members will appear in the payout order.")}</div>${data.payouts.length ? `<h3>Payout History</h3><div class="payout-list">${data.payouts.map((p) => link("payout-details", `<div class="grow"><h3>${e(memberName(p.member))}</h3><p class="muted">Cycle ${e(p.cycleNumber)} ? ${e(formatDate(p.payoutDate))}</p></div><div class="meta">${pill(p.status)}<span>${money(p.amount)}</span></div>${icon("arrow")}`, `payout-card ${p.status === "pending_approval" ? "today" : ""}`, idOf(p))).join("")}</div>` : ""}${user?.role !== "MEMBER" ? button("Trigger Payout Phase", "trigger-payout", "", data.cycle?.cycleNumber && data.contributions.some((c) => c.status === "CONFIRMED") ? "" : "disabled") : ""}`;
+  return `${title("Payout Schedule")}<a href="#group-details" class="card row" style="color:inherit"><span class="avatar">${icon("groups")}</span><div style="flex:1"><h3>${e(group()?.name || "Savings Group")}</h3><p class="muted small">${e(data.cycle?.cycleNumber ? `Cycle ${data.cycle.cycleNumber}` : "Waiting for member approval")}</p></div>${icon("arrow")}</a><div class="row between"><h3>Recipient Order (${order.length} Members)</h3>${user?.role !== "MEMBER" ? link("payout-order", "Manage Order", "text-btn") : ""}</div><div class="payout-list">${order.map((member, i) => `<div class="payout-card"><span class="avatar">${member.position || i + 1}</span><div class="grow"><h3>${e(memberName(member))}</h3><p class="muted">${e(member.role || "member")}</p></div>${pill(member.status)}</div>`).join("") || empty("No payout recipients", "Approved group members will appear in the payout order.")}</div>${data.payouts.length ? `<h3>Payout History</h3><div class="payout-list">${data.payouts.map((p) => link("payout-details", `<div class="grow"><h3>${e(memberName(p.member))}</h3><p class="muted">Cycle ${e(p.cycleNumber)} ? ${e(formatDate(p.payoutDate))}</p></div><div class="meta">${pill(p.status)}<span>${money(p.amount)}</span></div>${icon("arrow")}`, `payout-card ${p.status === "pending_approval" ? "today" : ""}`, idOf(p))).join("")}</div>` : ""}${user?.role !== "MEMBER" ? button("Trigger Payout Phase", "trigger-payout", "", data.cycle?.cycleNumber && data.contributions.some((c) => c.status === "CONFIRMED") ? "" : "disabled") : ""}`;
 }
 function payoutDetails() {
   const p = data.payouts.find((p) => idOf(p) === routeId);
@@ -2850,7 +2850,7 @@ function passwordUpdated() {
   );
 }
 function inactiveDashboard() {
-  return `${title("Good morning, Opeyemi", "Here is what?s happening with your savings group.")}<section class="inactive-cycle">${icon("calendar")}<h2>No Active Cycle</h2><p>A cycle starts automatically on the group?s scheduled contribution date.</p></section><section class="card stack"><h3>Quick Actions</h3>${link("members", "Manage Members", "list-row")}${link("groups", "View Groups", "list-row")}${link("group-settings", "Group Settings", "list-row")}</section>`;
+  return `${title("Good morning, Opeyemi", "Here is what?s happening with your savings group.")}<section class="inactive-cycle">${icon("calendar")}<h2>No Active Cycle Yet</h2><p>Approve a member request first. The group cycle will start when its scheduled contribution date arrives.</p></section><section class="card stack"><h3>Quick Actions</h3>${link("members", "Manage Members", "list-row")}${link("groups", "View Groups", "list-row")}${link("group-settings", "Group Settings", "list-row")}</section>`;
 }
 function groupSettings() {
   const g = group();
@@ -3189,7 +3189,13 @@ async function loadPage() {
         ].includes(route)
       )
         data.cycle = await api.currentCycle(groupId).then(unwrap).catch((error) => {
-          if (error.status === 404) return null;
+          // A group has no current cycle until one is created after member
+          // approval. Treat that expected response as an empty state.
+          if (
+            error.status === 404 ||
+            /no active cycle for this group/i.test(error.message || "")
+          )
+            return null;
           throw error;
         });
       if (route === "dashboard")
