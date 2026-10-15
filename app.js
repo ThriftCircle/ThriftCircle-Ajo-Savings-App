@@ -2263,14 +2263,40 @@ function shell(content) {
 function cycleBar() {
   const c = data.cycle || {};
   const cycleNumber = c.cycleNumber ?? c.number;
-  return `<div class="cycle-bar"><div><h3 class="muted">Current Cycle</h3><strong class="small">${e(c.name || (cycleNumber ? `Cycle ${cycleNumber}` : "Current Cycle"))}</strong></div><div class="cycle-selector"><select id="group-select" aria-label="Savings group">${data.groups.map((g) => `<option value="${e(idOf(g))}" ${idOf(g) === groupId ? "selected" : ""}>${e(preview && idOf(g) === "family" ? "My Family Ajo" : g.name)}</option>`).join("")}</select><span class="row small">${icon("calendar")} ${e(cycleNumber ? `Cycle ${cycleNumber}` : c.status || "Waiting for member approval")}</span></div></div>`;
+  const label = c.name || (cycleNumber ? `Cycle ${cycleNumber}` : "No active cycle");
+  const groupOptions = data.groups.map((g) => `<option value="${e(idOf(g))}" ${idOf(g) === groupId ? "selected" : ""}>${e(preview && idOf(g) === "family" ? "My Family Ajo" : g.name)}</option>`).join("");
+  if (user?.role === "MEMBER") {
+    return `<section class="member-cycle-row"><div class="member-current-cycle"><span>Current cycle</span><strong>${e(label)}</strong></div><div class="member-cycle-controls"><label class="member-select-wrap"><span class="sr-only">Savings group</span><select id="group-select" aria-label="Savings group">${groupOptions}</select></label><label class="member-select-wrap"><span class="sr-only">Cycle or week</span><select aria-label="Current cycle" disabled title="Cycle history is not available yet"><option>${e(cycleNumber ? `Cycle ${cycleNumber}` : "No active cycle")}</option></select></label></div></section>`;
+  }
+  return `<div class="cycle-bar"><div><h3 class="muted">Current Cycle</h3><strong class="small">${e(label === "No active cycle" ? "Current Cycle" : label)}</strong></div><div class="cycle-selector"><select id="group-select" aria-label="Savings group">${groupOptions}</select><span class="row small">${icon("calendar")} ${e(cycleNumber ? `Cycle ${cycleNumber}` : c.status || "Waiting for member approval")}</span></div></div>`;
 }
 function recentPayments(history = false) {
   const g = group();
+  const memberId = idOf(user) || idOf(data.dashboard?.currentContribution?.memberId) || idOf(data.dashboard?.currentContribution?.member);
   const rows = data.contributions
     .filter((c) => !g || c.groupId === idOf(g) || !c.groupId)
+    .filter((c) => user?.role !== "MEMBER" || preview || (memberId && idOf(c.member) === memberId))
     .filter((c) => /CONFIRMED|APPROVED/.test(c.status || ""));
-  return `<div><div class="section-head"><h3>${history ? "Contribution History" : "Recent Payments"}</h3>${history ? "" : link("history", "View Contribution History", "small", "")}</div><div class="table-wrap"><table><thead><tr><th>Date</th><th>Amount</th><th>Status</th>${history ? "<th>Actions</th>" : ""}</tr></thead><tbody>${rows.map((c) => `<tr><td>${e(formatDate(c.paymentDate || c.createdAt))}</td><td class="amount">${money(c.amount)}</td><td>${pill(c.status)}</td>${history ? `<td>${link("contribution-details", "View", "text-btn", idOf(c))}</td>` : ""}</tr>`).join("") || '<tr><td colspan="4">No confirmed contributions yet.</td></tr>'}</tbody></table></div></div>`;
+  return `<section class="member-payments"><div class="section-head"><h3>${history ? "Contribution History" : "Recent Payments"}</h3>${history ? "" : link("history", "View Contribution History", "small", "")}</div><div class="table-wrap"><table><thead><tr><th>Date</th><th>Amount</th><th>Status</th>${history ? "<th>Actions</th>" : ""}</tr></thead><tbody>${rows.map((c) => `<tr><td>${e(formatDate(c.confirmedAt || c.submittedAt || c.paymentDate || c.createdAt))}</td><td class="amount">${money(c.amount)}</td><td>${pill(c.status)}</td>${history ? `<td>${link("contribution-details", "View", "text-btn", idOf(c))}</td>` : ""}</tr>`).join("") || `<tr><td colspan="${history ? 4 : 3}" class="member-table-empty">No confirmed payments yet.</td></tr>`}</tbody></table></div></section>`;
+}
+function memberDashboard(g) {
+  const current = data.dashboard?.currentContribution || (preview ? data.contributions.find((c) => c.groupId === idOf(g) && ["DUE", "OVERDUE", "PENDING_REVIEW"].includes(c.status)) : null);
+  const firstName = memberName(user).split(/\s+/)[0];
+  const cycleStatus = String(data.cycle?.status || "").toUpperCase();
+  const cycleBadge = cycleStatus === "ACTIVE" || cycleStatus === "PAYOUT_PHASE" || (preview && g.status === "ACTIVE")
+    ? '<span class="member-active-badge"><i></i>Active</span>'
+    : '<span class="member-active-badge inactive"><i></i>No active cycle</span>';
+  const dueDate = current?.dueDate || current?.paymentDate;
+  const position = Number(data.dashboard?.payoutOrder);
+  const total = Number(data.dashboard?.cycleProgress?.total || g.members?.filter((m) => m.status === "ACTIVE").length || 0);
+  const hasPosition = Number.isInteger(position) && position > 0 && total > 0;
+  const segments = hasPosition
+    ? Array.from({ length: Math.min(total, 30) }, (_, index) => `<span class="${index < position ? "reached" : ""}" aria-hidden="true"></span>`).join("")
+    : "";
+  const amount = current?.amount;
+  const amountDue = Number.isFinite(Number(amount)) && amount !== null && amount !== undefined ? money(amount) : "—";
+  const memberAmount = Number.isFinite(Number(g.contributionAmount)) && g.contributionAmount !== null && g.contributionAmount !== undefined ? money(g.contributionAmount) : "—";
+  return `<div class="member-dashboard-heading"><div><h1>Good morning, ${e(firstName)}</h1><p>Here’s what’s happening with your savings group.</p></div>${cycleBadge}</div>${cycleBar()}<div class="member-dashboard-grid"><section class="member-contribution-card"><div class="member-card-heading"><div><span class="member-eyebrow">Next contribution</span><h2>${current ? amountDue : "No outstanding contribution"}</h2></div><span class="member-group-name">${e(g.name)}</span></div><div class="member-contribution-meta"><div><span>Amount</span><strong>${current ? amountDue : "—"}</strong></div><div><span>Due date</span><strong>${current ? e(formatDate(dueDate)) : "Not scheduled"}</strong></div></div><div class="member-dashboard-actions">${link("outstanding-contribution", "View Outstanding Contribution", "btn secondary")}${link("contributions", "Make Contributions", "btn")}</div></section><section class="member-position-card"><div class="member-card-heading"><div><span class="member-eyebrow">Your position in cycle</span><h2>${hasPosition ? `${position} of ${total}` : "Position unavailable"}</h2></div></div><div class="member-position-track" role="img" aria-label="${hasPosition ? `Position ${position} of ${total}` : "Cycle position unavailable"}">${segments || '<span class="member-position-empty">Position will appear when the cycle is active.</span>'}</div><div class="member-position-meta"><div><span>Expected payout date</span><strong>Not scheduled</strong></div><div><span>Amount per member</span><strong>${memberAmount}</strong></div></div></section></div>${recentPayments()}`;
 }
 function dashboard() {
   const g = group();
@@ -2284,8 +2310,7 @@ function dashboard() {
         "btn",
       ),
     );
-  if (user?.role === "MEMBER")
-    return `<div class="member-banner"><div><h3>${e(g.name)}</h3><p class="tiny">Amount Due</p><h1>${money(g.contributionAmount)}</h1></div><div><div class="banner-meta"><div><p class="tiny">Date Due</p><p>${preview ? "18, May" : e(formatDate(data.dashboard?.currentContribution?.dueDate || data.cycle?.dueDate))}</p></div><div><p class="tiny">Status</p>${pill(data.dashboard?.currentContribution?.status || "DUE")}</div></div>${link("contribution-details", "View Outstanding Contribution")}</div></div>${recentPayments()}`;
+  if (user?.role === "MEMBER") return memberDashboard(g);
   const d = data.dashboard || {};
   const counts = [
     ["Confirmed", d.confirmed ?? 0, "", "Payments received from members."],
@@ -2384,7 +2409,7 @@ function wizardActions(label = "Continue") {
   return `<div class="wizard-actions"><button class="btn" type="submit">${label}</button></div>`;
 }
 function createGroup() {
-  return `${title("Create a New Group", "Set up the schedule and rules for your savings group.")}<form id="create-group-form"><div class="grid form-grid">${field("Group Name", "name", "text", "e.g. Family Savings Circle", groupDraft.name, 'required maxlength="100"')}${select("Member Limit", "memberCount", [["", "Choose a member limit"], ...[3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30].map((n) => [n, n + " members"])], groupDraft.memberCount, "required")}</div>${formError}${wizardActions()}</form>`;
+  return `${title("Create a New Group", "Set up your savings group and the account members should pay into.")}<form id="create-group-form"><div class="grid form-grid">${field("Group Name", "name", "text", "e.g. Family Savings Circle", groupDraft.name, 'required maxlength="100"')}${select("Member Limit", "memberCount", [["", "Choose a member limit"], ...[3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30].map((n) => [n, n + " members"])], groupDraft.memberCount, "required")}${field("Bank Name", "bankName", "text", "e.g. Access Bank", groupDraft.bankName, 'required maxlength="100"')}${field("Account Name", "accountName", "text", "Name on the bank account", groupDraft.accountName, 'required maxlength="100"')}${field("Account Number", "accountNumber", "text", "Enter 10-digit account number", groupDraft.accountNumber, 'required inputmode="numeric" pattern="[0-9]{10}" maxlength="10"')}${field("Payment Reference (optional)", "reference", "text", "e.g. Group name and contribution month", groupDraft.reference, 'maxlength="100"')}</div>${formError}${wizardActions()}</form>`;
 }
 function contributionSetup() {
   return `${title("Contribution Setup", "Define how and when members will contribute.")}<form id="contribution-setup-form"><div class="grid form-grid">${field("Contribution amount", "contributionAmount", "number", "e.g. ₦50,000", groupDraft.contributionAmount, 'required min="1" step="0.01"')}${select(
@@ -2431,7 +2456,7 @@ function reviewGroup() {
     [
       "Group Details",
       "create-group",
-      `${e(groupDraft.name)}<br>Member limit: ${e(groupDraft.memberCount)}`,
+      `${e(groupDraft.name)}<br>Member limit: ${e(groupDraft.memberCount)}<br>Bank: ${e(groupDraft.bankName)}<br>Account name: ${e(groupDraft.accountName)}<br>Account number: ${e(groupDraft.accountNumber)}`,
       "groups",
     ],
     [
@@ -3453,6 +3478,10 @@ document.addEventListener("submit", async (event) => {
             frequency: groupDraft.frequency.toLowerCase(),
             startDate: groupDraft.startDate,
             contributionDeadline: groupDraft.contributionDeadline,
+            bankName: groupDraft.bankName.trim(),
+            accountName: groupDraft.accountName.trim(),
+            accountNumber: groupDraft.accountNumber.trim(),
+            reference: groupDraft.reference?.trim() || "",
           };
           let g = preview
             ? {

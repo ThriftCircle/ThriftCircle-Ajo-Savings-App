@@ -1441,6 +1441,225 @@ dialog form {
 .member-layout .member-banner {
   padding: 28px 32px;
 }
+.member-dashboard-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+.member-dashboard-heading h1 {
+  color: #17211d;
+  font-size: 30px;
+  letter-spacing: -0.035em;
+}
+.member-dashboard-heading p {
+  margin-top: 8px;
+  color: #68736e;
+  font-size: 15px;
+}
+.member-active-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 8px 13px;
+  border: 1px solid #b5e3ce;
+  border-radius: 999px;
+  background: #effaf4;
+  color: #187044;
+  font-size: 13px;
+  font-weight: 600;
+}
+.member-active-badge i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #22a765;
+}
+.member-active-badge.inactive {
+  border-color: #d9dedb;
+  background: #f4f6f5;
+  color: #66716c;
+}
+.member-active-badge.inactive i {
+  background: #9aa39e;
+}
+.member-cycle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 16px 20px;
+  border: 1px solid #e3e8e5;
+  border-radius: 12px;
+  background: #fff;
+}
+.member-current-cycle,
+.member-cycle-controls,
+.member-select-wrap {
+  display: flex;
+  align-items: center;
+}
+.member-current-cycle {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+}
+.member-current-cycle span,
+.member-eyebrow,
+.member-contribution-meta span,
+.member-position-meta span {
+  color: #69756f;
+  font-size: 13px;
+}
+.member-current-cycle strong {
+  font-size: 15px;
+  font-weight: 600;
+}
+.member-cycle-controls {
+  gap: 12px;
+  min-width: 0;
+}
+.member-select-wrap {
+  min-width: 0;
+}
+.member-select-wrap select {
+  width: auto;
+  min-width: 160px;
+  min-height: 42px;
+  padding: 9px 34px 9px 12px;
+  border-color: #dfe5e1;
+  background: #fff;
+  font-size: 13px;
+}
+.member-select-wrap select:disabled {
+  color: #56635c;
+  opacity: 1;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.member-dashboard-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+  gap: 20px;
+}
+.member-contribution-card,
+.member-position-card {
+  min-width: 0;
+  padding: 24px;
+  border: 1px solid #e1e7e3;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 2px 8px #173b2910;
+}
+.member-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.member-card-heading h2 {
+  margin-top: 9px;
+  color: #16241c;
+  font-size: 25px;
+  letter-spacing: -0.025em;
+}
+.member-group-name {
+  max-width: 45%;
+  color: #66716b;
+  font-size: 13px;
+  text-align: right;
+}
+.member-contribution-meta,
+.member-position-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid #edf0ee;
+}
+.member-contribution-meta > div,
+.member-position-meta > div {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+.member-contribution-meta strong,
+.member-position-meta strong {
+  color: #1e2b24;
+  font-size: 15px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.member-dashboard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 22px;
+}
+.member-dashboard-actions .btn {
+  min-height: 44px;
+  padding: 10px 16px;
+  font-size: 13px;
+}
+.member-position-track {
+  display: flex;
+  gap: 5px;
+  min-height: 12px;
+  margin-top: 24px;
+}
+.member-position-track > span:not(.member-position-empty) {
+  flex: 1;
+  min-width: 3px;
+  height: 10px;
+  border-radius: 999px;
+  background: #e7ece9;
+}
+.member-position-track > span.reached {
+  background: #18915b;
+}
+.member-position-empty {
+  color: #7a8580;
+  font-size: 13px;
+}
+.member-position-meta {
+  margin-top: 18px;
+}
+.member-payments .section-head {
+  margin-bottom: 14px;
+}
+.member-payments .section-head h3 {
+  color: #1b2821;
+  font-size: 19px;
+}
+.member-payments .section-head a {
+  font-size: 13px;
+  font-weight: 600;
+}
+.member-payments th {
+  background: #f5f7f6;
+  font-weight: 600;
+}
+.member-payments th,
+.member-payments td {
+  padding: 16px 20px;
+}
+.member-payments .member-table-empty {
+  color: #727d77;
+  text-align: center;
+  white-space: normal;
+}
 @media (min-width: 1700px) {
   .auth-left {
     align-items: center;
@@ -1832,6 +2051,83 @@ dialog form {
   .member-banner a {
     display: block;
     margin-top: 16px;
+  }
+  .member-dashboard-heading {
+    align-items: flex-start;
+  }
+  .member-dashboard-heading h1 {
+    font-size: 24px;
+  }
+  .member-dashboard-heading p {
+    font-size: 13px;
+  }
+  .member-active-badge {
+    gap: 6px;
+    padding: 7px 10px;
+    font-size: 12px;
+  }
+  .member-cycle-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 14px;
+    padding: 16px;
+  }
+  .member-cycle-controls {
+    width: 100%;
+  }
+  .member-select-wrap {
+    flex: 1;
+  }
+  .member-select-wrap select {
+    width: 100%;
+    min-width: 0;
+    padding: 9px 26px 9px 9px;
+    font-size: 12px;
+  }
+  .member-dashboard-grid {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+  .member-contribution-card,
+  .member-position-card {
+    padding: 18px;
+  }
+  .member-card-heading h2 {
+    font-size: 21px;
+  }
+  .member-group-name {
+    font-size: 12px;
+  }
+  .member-contribution-meta,
+  .member-position-meta {
+    gap: 12px;
+    margin-top: 18px;
+    padding-top: 15px;
+  }
+  .member-contribution-meta span,
+  .member-position-meta span {
+    font-size: 12px;
+  }
+  .member-contribution-meta strong,
+  .member-position-meta strong {
+    font-size: 14px;
+  }
+  .member-dashboard-actions {
+    flex-direction: column;
+  }
+  .member-dashboard-actions .btn {
+    width: 100%;
+  }
+  .member-payments .section-head h3 {
+    font-size: 17px;
+  }
+  .member-payments .section-head a {
+    font-size: 12px;
+  }
+  .member-payments th,
+  .member-payments td {
+    padding: 13px 12px;
+    font-size: 12px;
   }
   .filters {
     gap: 12px;
