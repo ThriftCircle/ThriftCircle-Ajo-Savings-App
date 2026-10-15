@@ -1,9 +1,7 @@
 window.THRIFTCIRCLE_CONFIG = Object.freeze({
-  apiBaseUrl: "https://thriftcircle-api.onrender.com/api",
+  apiBaseUrl: "https://thriftcircle.onrender.com/api",
   requestTimeout: 20000,
-  evidenceField: "receipt",
+  evidenceField: "file",
   termsUrl: "",
   privacyUrl: "",
-  memberStatusPath: "",
-  createCyclePath: "",
 });

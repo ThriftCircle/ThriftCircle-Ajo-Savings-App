@@ -17,6 +17,8 @@ function createApi({
   baseUrl,
   timeout = 20000,
   getToken = () => null,
+  getRefreshToken = () => null,
+  onTokensRefreshed = () => {},
   onUnauthorized = () => {},
   fetchImpl = fetch,
 }) {
@@ -25,6 +27,7 @@ function createApi({
   async function request(
     path,
     { method = "GET", body, authenticated = true, signal } = {},
+    retried = false,
   ) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
@@ -64,7 +67,37 @@ function createApi({
         }
       }
       if (!response.ok) {
-        if (response.status === 401 && authenticated) onUnauthorized();
+        if (response.status === 401 && authenticated) {
+          if (
+            !retried &&
+            data?.code === "TOKEN_EXPIRED" &&
+            getRefreshToken()
+          ) {
+            try {
+              const tokens = await request(
+                "/auth/refresh",
+                {
+                  method: "POST",
+                  body: { refreshToken: getRefreshToken() },
+                  authenticated: false,
+                },
+                true,
+              );
+              if (tokens?.accessToken && tokens?.refreshToken) {
+                onTokensRefreshed(tokens);
+                return await request(
+                  path,
+                  { method, body, authenticated, signal },
+                  true,
+                );
+              }
+            } catch {
+              onUnauthorized();
+            }
+          } else {
+            onUnauthorized();
+          }
+        }
         const message =
           data?.message ||
           data?.error?.message ||
@@ -108,11 +141,14 @@ function createApi({
       send("/auth/forgot-password", "POST", body, false),
     resetPassword: (body) => send("/auth/reset-password", "POST", body, false),
     refresh: (body) => send("/auth/refresh", "POST", body, false),
-    logout: (body) => send("/auth/logout", "POST", body),
+    logout: (body) => send("/auth/logout", "POST", body, false),
     createGroup: (body) => send("/groups", "POST", body),
     joinGroup: (body) => send("/groups/join", "POST", body),
     myGroups: () => request("/groups/mine"),
     group: (id) => request(groupPath(id)),
+    groupRules: (id) => request(`${groupPath(id)}/rules`),
+    updateGroupRules: (id, body) =>
+      send(`${groupPath(id)}/rules`, "PUT", body),
     pendingMembers: (id) => request(`${groupPath(id)}/pending`),
     approveMember: (id, userId, reason = "") =>
       send(`${groupPath(id)}/members/${segment(userId)}/approve`, "PATCH", {
@@ -140,12 +176,12 @@ function createApi({
     resolveIssue: (id, body) =>
       send(`/issues/${segment(id)}/resolve`, "PATCH", body),
     currentCycle: (id) => request(`${groupPath(id)}/cycles/current`),
-    triggerPayout: (id) => send(`${groupPath(id)}/payouts`, "POST"),
+    triggerPayout: (id, cycleNumber) =>
+      send(`${groupPath(id)}/payouts`, "POST", { cycleNumber }),
     payouts: (id) => request(`${groupPath(id)}/payouts`),
-    reorderPayouts: (id, payoutOrder) =>
-      send(`${groupPath(id)}/payouts/order`, "PUT", { payoutOrder }),
-    approvePayout: (id, transactionNotes = "") =>
-      send(`/payouts/${segment(id)}/approve`, "PATCH", { transactionNotes }),
+    reorderPayouts: (id, order) =>
+      send(`${groupPath(id)}/payouts/order`, "PUT", { order }),
+    approvePayout: (id) => send(`/payouts/${segment(id)}/approve`, "PATCH"),
     organizerDashboard: (id) => request(`${groupPath(id)}/dashboard/organizer`),
     memberDashboard: (id) => request(`${groupPath(id)}/dashboard/member`),
     outstanding: (id) => request(`${groupPath(id)}/outstanding`),
@@ -178,6 +214,43 @@ const initials = (value) =>
 const idOf = (value) =>
   typeof value === "string" ? value : value?.id || value?._id || "";
 const unwrap = (value) => value?.data ?? value;
+const memberIdOf = (member) => idOf(member?.userId || member);
+function normalizeMember(member) {
+  const userRecord = member?.userId && typeof member.userId === "object"
+    ? member.userId
+    : member;
+  return {
+    ...member,
+    ...userRecord,
+    id: idOf(userRecord) || idOf(member?.userId),
+    membershipId: idOf(member),
+    status: String(member?.status || "active").toUpperCase(),
+    joinedAt: member?.joinedAt,
+    position: member?.payoutOrder || member?.position,
+  };
+}
+function normalizeGroup(value) {
+  const response = unwrap(value) || {};
+  const groupRecord = response.group || response;
+  return {
+    ...groupRecord,
+    id: idOf(groupRecord),
+    name: groupRecord.name || groupRecord.groupName || "Savings Group",
+    members: (response.members || groupRecord.members || []).map(normalizeMember),
+    role: response.callerRole || groupRecord.role,
+  };
+}
+function normalizeContribution(value) {
+  const contribution = unwrap(value) || {};
+  return {
+    ...contribution,
+    id: idOf(contribution),
+    paymentDate: contribution.paymentDate || contribution.dueDate,
+    cycle: contribution.cycle || (contribution.cycleNumber ? `Cycle ${contribution.cycleNumber}` : ""),
+    feedback: contribution.feedback || contribution.issueReason || "",
+    member: contribution.member || contribution.memberId,
+  };
+}
 const listOf = (value, key) => {
   const data = unwrap(value);
   if (Array.isArray(data)) return data;
@@ -195,30 +268,19 @@ const formatDate = (value) => {
     year: "numeric",
   });
 };
-function validatePayoutOrder(payouts, order) {
-  if (!Array.isArray(order) || order.length !== payouts.length)
+function validatePayoutOrder(members, order) {
+  if (!Array.isArray(order) || order.length !== members.length)
     throw new Error("The payout order must include every member.");
-  const ids = payouts.map((p) => String(idOf(p.member || p.memberId)));
-  const proposed = order.map((p) => String(p.memberId));
+  const ids = members.map((member) => String(idOf(member)));
+  const proposed = order.map((entry) => String(entry.userId));
   if (
     new Set(proposed).size !== proposed.length ||
     proposed.some((id) => !ids.includes(id))
   )
     throw new Error("Each member must appear exactly once.");
   order.forEach((entry, index) => {
-    if (entry.position !== index + 1)
+    if (entry.payoutOrder !== index + 1)
       throw new Error("Payout positions must be consecutive.");
-  });
-  payouts.forEach((entry, index) => {
-    if (
-      ["completed", "approved", "COMPLETED", "APPROVED"].includes(
-        entry.status,
-      ) &&
-      proposed[index] !== ids[index]
-    )
-      throw new Error(
-        "Members who have received a payout cannot be reordered.",
-      );
   });
   return order;
 }
@@ -1917,6 +1979,7 @@ const preview =
 const app = document.getElementById("app");
 const dialog = document.getElementById("modal");
 let user = null;
+let resetEmail = sessionStorage.getItem("thriftcircle.resetEmail") || "";
 try {
   user = JSON.parse(sessionStorage.getItem("thriftcircle.user") || "null");
 } catch {
@@ -1960,8 +2023,14 @@ const api = createApi({
   baseUrl: config.apiBaseUrl,
   timeout: config.requestTimeout,
   getToken: () => sessionStorage.getItem("thriftcircle.token"),
+  getRefreshToken: () => sessionStorage.getItem("thriftcircle.refreshToken"),
+  onTokensRefreshed: (tokens) => {
+    sessionStorage.setItem("thriftcircle.token", tokens.accessToken);
+    sessionStorage.setItem("thriftcircle.refreshToken", tokens.refreshToken);
+  },
   onUnauthorized: () => {
     sessionStorage.removeItem("thriftcircle.token");
+    sessionStorage.removeItem("thriftcircle.refreshToken");
     sessionStorage.removeItem("thriftcircle.user");
     user = null;
   },
@@ -2036,7 +2105,7 @@ const memberName = (value) =>
 const currentContribution = () =>
   data.contributions.find((c) => idOf(c) === routeId) ||
   data.contributions.find(
-    (c) => (c.groupId === groupId || !c.groupId) && c.status !== "CONFIRMED",
+    (c) => (c.groupId === groupId || !c.groupId) && ["DUE", "OVERDUE", "ISSUE"].includes(c.status),
   ) ||
   data.contributions.find((c) => c.groupId === groupId || !c.groupId);
 function pill(status) {
@@ -2047,6 +2116,7 @@ function pill(status) {
     DUE: "Due",
     COMPLETED: "Completed",
     UNDER_REVIEW: "Under Review",
+    PENDING_REVIEW: "Awaiting Review",
     PENDING: "Pending",
     PENDING_APPROVAL: "Due Today",
     ACTIVE: "Active Cycle",
@@ -2106,13 +2176,13 @@ function welcome() {
 }
 function chooseRole() {
   return authLayout(
-    `<h1>Choose a role</h1><p class="lead">Select how you want to use ThriftCircle.</p><form id="role-form" class="role-options"><label class="role-card"><span class="avatar">${icon("users")}</span><div><h2>Organizer</h2><p>Create and manage savings groups, invite members, and track contributions.</p></div><input type="radio" name="role" value="ORGANIZER" ${activeScreen?.state === "organizer" ? "checked" : ""} required></label><label class="role-card"><span class="avatar">${icon("profile")}</span><div><h2>Member</h2><p>Join a savings group, make contributions, and track your progress.</p></div><input type="radio" name="role" value="MEMBER" ${activeScreen?.state === "member" ? "checked" : ""} required></label>${formError}<button class="btn block" type="submit" ${activeScreen?.state === "member" || activeScreen?.state === "organizer" ? "" : "disabled"}>Continue</button></form>`,
+    `<h1>Choose a role</h1><p class="lead">Select how you want to use ThriftCircle.</p><form id="role-form" class="role-options"><label class="role-card"><span class="avatar">${icon("users")}</span><div><h2>Organizer</h2><p>Create and manage savings groups, invite members, and track contributions.</p></div><input type="radio" name="role" value="ORGANIZER" ${activeScreen?.state === "organizer" ? "checked" : ""} required></label><label class="role-card"><span class="avatar">${icon("profile")}</span><div><h2>Member</h2><p>Join a savings group, make contributions, and track your progress.</p></div><input type="radio" name="role" value="MEMBER" ${activeScreen?.state === "member" ? "checked" : ""} required></label>${formError}<button class="btn block" type="submit" >Continue</button></form>`,
     3,
   );
 }
 function login() {
   return authLayout(
-    `<h1>Welcome back</h1><p class="lead">Log in to your ThriftCircle account.</p><form id="login-form" class="auth-form">${field("Email Address", "email", "email", "Enter your email address", "", 'required autocomplete="email"')}${passwordField("Password", "password", "Enter password", 1)}${link("forgot-password", "Forgot Password?", "forgot-link")}${formError}<button class="btn block" type="submit">Log in</button></form><p class="auth-foot">Don’t have an account? ${link("role", "Sign Up")}</p>`,
+    `<h1>Welcome back</h1><p class="lead">Log in to your ThriftCircle account.</p><form id="login-form" class="auth-form">${field("Email or Phone Number", "loginIdentifier", "text", "Enter your email or phone number", "", 'required autocomplete="username"')}${passwordField("Password", "password", "Enter password", 1)}${link("forgot-password", "Forgot Password?", "forgot-link")}${formError}<button class="btn block" type="submit">Log in</button></form><p class="auth-foot">Don’t have an account? ${link("role", "Sign Up")}</p>`,
     5,
   );
 }
@@ -2125,13 +2195,13 @@ function signup() {
 }
 function forgot() {
   return authLayout(
-    `<h1>Forgot Password?</h1><p class="lead">Enter the email linked to your account and we will send you a reset link.</p><form id="forgot-form" class="auth-form">${field("Email Address", "email", "email", "Enter your email address", "", 'required autocomplete="email"')}${formError}<button class="btn block" type="submit">Send Reset Link</button></form>`,
+    `<h1>Forgot Password?</h1><p class="lead">Enter the email linked to your account to request a password reset code.</p><form id="forgot-form" class="auth-form">${field("Email Address", "email", "email", "Enter your email address", "", 'required autocomplete="email"')}${formError}<button class="btn block" type="submit">Request Reset Code</button></form>`,
     6,
   );
 }
 function reset() {
   return authLayout(
-    `<h1>Reset Password</h1><p class="lead">Create a new password for your ThriftCircle account</p><form id="reset-form" class="auth-form">${passwordField("New Password", "password", "Enter password")}${passwordField("Confirm New Password", "confirmPassword", "Confirm new password")}<p class="small muted">Use at least 8 characters</p>${formError}<button class="btn block" type="submit">Reset Password</button></form>`,
+    `<h1>Reset Password</h1><p class="lead">Enter the reset code and create a new password.</p><form id="reset-form" class="auth-form">${field("Account Email", "email", "email", "Enter your email address", resetEmail, 'required autocomplete="email"')}${field("Reset Code", "resetCode", "text", "Enter the 6-digit code", "", 'required inputmode="numeric" pattern="[0-9]{6}" maxlength="6"')}${passwordField("New Password", "password", "Enter password")}${passwordField("Confirm New Password", "confirmPassword", "Confirm new password")}<p class="small muted">Use at least 8 characters</p>${formError}<button class="btn block" type="submit">Reset Password</button></form>`,
     7,
   );
 }
@@ -2192,7 +2262,8 @@ function shell(content) {
 }
 function cycleBar() {
   const c = data.cycle || {};
-  return `<div class="cycle-bar"><div><h3 class="muted">Current Cycle</h3><strong class="small">${e(c.name || "Current Cycle")}</strong></div><div class="cycle-selector"><select id="group-select" aria-label="Savings group">${data.groups.map((g) => `<option value="${e(idOf(g))}" ${idOf(g) === groupId ? "selected" : ""}>${e(preview && idOf(g) === "family" ? "My Family Ajo" : g.name)}</option>`).join("")}</select><span class="row small">${icon("calendar")} ${e(c.number ? `Cycle ${c.number}. Week ${c.week || 1} of ${c.totalWeeks || "—"}` : c.status || "No active cycle")}</span></div></div>`;
+  const cycleNumber = c.cycleNumber ?? c.number;
+  return `<div class="cycle-bar"><div><h3 class="muted">Current Cycle</h3><strong class="small">${e(c.name || (cycleNumber ? `Cycle ${cycleNumber}` : "Current Cycle"))}</strong></div><div class="cycle-selector"><select id="group-select" aria-label="Savings group">${data.groups.map((g) => `<option value="${e(idOf(g))}" ${idOf(g) === groupId ? "selected" : ""}>${e(preview && idOf(g) === "family" ? "My Family Ajo" : g.name)}</option>`).join("")}</select><span class="row small">${icon("calendar")} ${e(cycleNumber ? `Cycle ${cycleNumber}` : c.status || "No active cycle")}</span></div></div>`;
 }
 function recentPayments(history = false) {
   const g = group();
@@ -2214,7 +2285,7 @@ function dashboard() {
       ),
     );
   if (user?.role === "MEMBER")
-    return `<div class="member-banner"><div><h3>${e(g.name)}</h3><p class="tiny">Amount Due</p><h1>${money(g.contributionAmount)}</h1></div><div><div class="banner-meta"><div><p class="tiny">Date Due</p><p>${preview ? "18, May" : e(formatDate(data.cycle?.dueDate))}</p></div><div><p class="tiny">Status</p>${pill("PENDING")}</div></div>${link("contribution-details", "View Outstanding Contribution")}</div></div>${recentPayments()}`;
+    return `<div class="member-banner"><div><h3>${e(g.name)}</h3><p class="tiny">Amount Due</p><h1>${money(g.contributionAmount)}</h1></div><div><div class="banner-meta"><div><p class="tiny">Date Due</p><p>${preview ? "18, May" : e(formatDate(data.dashboard?.currentContribution?.dueDate || data.cycle?.dueDate))}</p></div><div><p class="tiny">Status</p>${pill(data.dashboard?.currentContribution?.status || "DUE")}</div></div>${link("contribution-details", "View Outstanding Contribution")}</div></div>${recentPayments()}`;
   const d = data.dashboard || {};
   const counts = [
     ["Confirmed", d.confirmed ?? 0, "", "Payments received from members."],
@@ -2277,7 +2348,7 @@ function groups() {
     data.groups
       .map(
         (g) =>
-          `<section class="card group-card"><div class="row between"><h2>${e(g.name)}</h2>${pill(g.status)}</div><p class="muted">${e(g.description || "")}</p>${details(
+          `<section class="card group-card"><div class="row between"><h2>${e(g.name)}</h2>${pill(g.status)}</div><p class="muted">${e("")}</p>${details(
             [
               ["Contribution amount", money(g.contributionAmount)],
               ["Members", e(g.memberCount || (g.members || []).length)],
@@ -2297,39 +2368,23 @@ function groupDetails() {
       "Select a savings group.",
       link("groups", "Back to Groups", "btn"),
     );
-  return `${title(g.name, g.description || "")}${cycleBar()}<div class="grid"><section class="card stack"><h2>Group Details</h2>${details(
+  return `${title(g.name, "")}${cycleBar()}<div class="grid"><section class="card stack"><h2>Group Details</h2>${details(
     [
       ["Members", e(g.memberCount || (g.members || []).length)],
       ["Contribution Amount", money(g.contributionAmount)],
       ["Frequency", e(g.frequency)],
-      ["Group Type", e(g.type)],
     ],
   )}</section><section class="card stack"><h2>Group Rules</h2>${details([
-    ["Late Payment", `${Number(g.rules?.latePaymentDays || 3)} days`],
-    [
-      "Missed Contributions",
-      e(g.rules?.missedContributions || "Member contacts organiser"),
-    ],
-    [
-      "Leaving the group",
-      e(g.rules?.leavingGroup || "Requires organiser approval"),
-    ],
+    ["Grace Period", `${Number(data.rules?.gracePeriodDays ?? 0)} days`],
+    ["Late Evidence", data.rules?.allowLateSubmission === false ? "Not allowed" : "Allowed"],
+    ["Member Limit", data.rules?.maxMembers ?? "No limit"],
   ])}</section></div><div class="pending-actions">${link("contributions", "View Contributions", "btn")}${link("payouts", "Payout Schedule", "btn secondary")}${user?.role !== "MEMBER" ? link("invite-members", "Invite Members", "btn secondary") + link("pending-members", "Pending Requests", "btn secondary") : ""}</div>`;
 }
 function wizardActions(label = "Continue") {
   return `<div class="wizard-actions"><button class="btn" type="submit">${label}</button></div>`;
 }
 function createGroup() {
-  return `${title("Create a New Group", "Let’s set up your savings group.")}<form id="create-group-form"> <div class="grid form-grid">${field("Group Name", "name", "text", "e.g Family Savings Circle", groupDraft.name, 'required maxlength="100"')}${select("Member Count", "memberCount", [["", "Select number of members"], ...[3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30].map((n) => [n, n + " members"])], groupDraft.memberCount, "required")}<label class="field full"><strong>Group Description</strong><textarea name="description" placeholder="A short description of your group (optional)" maxlength="200">${e(groupDraft.description)}</textarea><span class="counter"><span id="description-count">${(groupDraft.description || "").length}</span>/200</span></label><div class="field full"><strong>Group Type</strong><div class="choice-group">${[
-    ["FAMILY", "Family"],
-    ["AJO_ESUSU", "Ajo/Esusu"],
-    ["OTHER", "Others"],
-  ]
-    .map(
-      ([value, label]) =>
-        `<label class="choice"><span class="avatar">${icon("groups")}</span><span>${label}</span><input type="radio" name="type" value="${value}" ${value === (groupDraft.type || "FAMILY") ? "checked" : ""}></label>`,
-    )
-    .join("")}</div></div></div>${formError}${wizardActions()}</form>`;
+  return `${title("Create a New Group", "Set up the schedule and rules for your savings group.")}<form id="create-group-form"><div class="grid form-grid">${field("Group Name", "name", "text", "e.g. Family Savings Circle", groupDraft.name, 'required maxlength="100"')}${select("Member Limit", "memberCount", [["", "Choose a member limit"], ...[3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30].map((n) => [n, n + " members"])], groupDraft.memberCount, "required")}</div>${formError}${wizardActions()}</form>`;
 }
 function contributionSetup() {
   return `${title("Contribution Setup", "Define how and when members will contribute.")}<form id="contribution-setup-form"><div class="grid form-grid">${field("Contribution amount", "contributionAmount", "number", "e.g. ₦50,000", groupDraft.contributionAmount, 'required min="1" step="0.01"')}${select(
@@ -2337,7 +2392,6 @@ function contributionSetup() {
     "frequency",
     [
       ["", "Select frequency"],
-      ["DAILY", "Daily"],
       ["WEEKLY", "Weekly"],
       ["MONTHLY", "Monthly"],
     ],
@@ -2346,33 +2400,17 @@ function contributionSetup() {
   )}${field("Contribution Start Date", "startDate", "date", "", groupDraft.startDate, "required")}${field("Contribution Deadline", "contributionDeadline", "date", "", groupDraft.contributionDeadline, "required")}</div>${formError}${wizardActions()}</form>`;
 }
 function groupRules() {
-  return `${title("Group Rules", "Create clear rules so everyone understands how the group works.")}<form id="group-rules-form"><div class="rules-grid">${select(
-    "Group Name",
-    "latePaymentDays",
-    [
-      [0, "No grace period"],
-      [3, "Late Payment — 3 days"],
-      [5, "Late Payment — 5 days"],
-      [7, "Late Payment — 7 days"],
-    ],
-    groupDraft.latePaymentDays ?? 3,
+  return `${title("Group Rules", "Set the payment grace period and late submission policy.")}<form id="group-rules-form"><div class="rules-grid">${select(
+    "Grace Period",
+    "gracePeriodDays",
+    [[0, "No grace period"], [3, "3 days"], [5, "5 days"], [7, "7 days"]],
+    groupDraft.gracePeriodDays ?? 0,
   )}${select(
-    "Missed Contributions",
-    "missedContributions",
-    [
-      ["Member contacts organiser", "Member contacts organiser"],
-      ["Organiser contacts member", "Organiser contacts member"],
-    ],
-    groupDraft.missedContributions,
-  )}${select(
-    "Leaving the group",
-    "leavingGroup",
-    [
-      ["Requires organiser approval", "Requires organiser approval"],
-      ["Member notifies organiser", "Member notifies organiser"],
-    ],
-    groupDraft.leavingGroup,
-  )}<label class="field"><strong>Custom rules</strong><span class="small">+ Add a custom rule</span><textarea name="customRules" placeholder="e.g members must notify the organiser before missing a contribution" style="min-height:60px">${e(groupDraft.customRules)}</textarea></label></div>${formError}${wizardActions()}</form>`;
+    "Late Payment Evidence",
+    "allowLateSubmission",
+    [["true", "Allow late submission"], ["false", "Do not allow late submission"]],
+    String(groupDraft.allowLateSubmission ?? true),
+  )}</div>${formError}${wizardActions()}</form>`;
 }
 function payoutConfig() {
   return `${title("Payout Configuration", "Choose how payout turns will be arranged and when each payout will be recorded.")}<form id="payout-config-form"><p>How will members payout turns be decided?</p><div class="choice-grid">${[
@@ -2393,7 +2431,7 @@ function reviewGroup() {
     [
       "Group Details",
       "create-group",
-      `${e(groupDraft.name)}<br>${e(groupDraft.memberCount)} Members<br>${e(groupDraft.description || "Group Description")}<br>${e(groupDraft.type)}`,
+      `${e(groupDraft.name)}<br>Member limit: ${e(groupDraft.memberCount)}`,
       "groups",
     ],
     [
@@ -2402,19 +2440,7 @@ function reviewGroup() {
       `${money(groupDraft.contributionAmount)}<br>${e(groupDraft.frequency)}<br>Starts ${e(formatDate(groupDraft.startDate))}<br>Deadline ${e(formatDate(groupDraft.contributionDeadline))}`,
       "calendar",
     ],
-    ["Group Rules", "group-rules", "3 Rules", "info"],
-    [
-      "Payout Configuration",
-      "payout-configuration",
-      e(
-        groupDraft.payoutMethod === "JOIN_ORDER"
-          ? "Order of joining"
-          : groupDraft.payoutMethod === "RANDOM"
-            ? "Random Order"
-            : "Organiser assigns after member joins",
-      ),
-      "groups",
-    ],
+    ["Group Rules", "group-rules", `${groupDraft.gracePeriodDays ?? 0} grace days; late evidence ${groupDraft.allowLateSubmission === false ? "disabled" : "allowed"}`, "info"],
   ];
   return `${title("Review Group Setup", "Please review your group details before creating it. You can edit any section if needed.")}<form id="review-group-form"><div class="grid setup-review">${cards.map(([heading, page, text, image]) => `<section class="card"><span class="avatar">${icon(image)}</span><div class="grow"><h3>${heading}</h3><p>${text}</p></div>${link(page, "Edit")}</section>`).join("")}</div>${formError}${wizardActions("Create Group")}</form>`;
 }
@@ -2460,8 +2486,8 @@ function members() {
       "#047857",
     ],
     [
-      "Inactive Members",
-      all.filter((m) => m.status === "INACTIVE").length,
+      "Removed Members",
+      all.filter((m) => m.status === "REMOVED").length,
       "#4b5563",
     ],
   ]
@@ -2471,7 +2497,7 @@ function members() {
     )
     .join(
       "",
-    )}</div><section class="card"><div class="filters"><div class="search-box">${icon("search")}<input id="list-search" type="search" value="${e(search)}" placeholder="Search member by name or phone number........" aria-label="Search members"></div><select id="status-filter" aria-label="Membership status"><option value="">All Status</option><option value="ACTIVE" ${filter === "ACTIVE" ? "selected" : ""}>Active Cycle</option><option value="INACTIVE" ${filter === "INACTIVE" ? "selected" : ""}>Inactive Cycle</option></select>${link("pending-members", "Pending requests", "btn secondary compact")}</div><div class="table-wrap"><table><thead><tr><th>Member</th><th>Phone Number</th><th>Membership Status</th><th>Date Joined</th><th>Contribution Position</th><th>Actions</th></tr></thead><tbody>${rows.map((m, i) => `<tr><td><strong>${e(memberName(m))}</strong></td><td>${e(m.phoneNumber || "—")}</td><td>${pill(m.status)}</td><td>${e(formatDate(m.joinedAt))}</td><td>${m.position || i + 1} of ${all.length}</td><td>${link("member-details", "View", "btn secondary compact", idOf(m))}</td></tr>`).join("") || '<tr><td colspan="6">No matching members.</td></tr>'}</tbody></table></div><div class="pagination">Showing ${rows.length ? "1" : "0"}–${rows.length} of ${all.length} members</div></section>`;
+    )}</div><section class="card"><div class="filters"><div class="search-box">${icon("search")}<input id="list-search" type="search" value="${e(search)}" placeholder="Search member by name or phone number........" aria-label="Search members"></div><select id="status-filter" aria-label="Membership status"><option value="">All Status</option><option value="ACTIVE" ${filter === "ACTIVE" ? "selected" : ""}>Active Members</option><option value="REMOVED" ${filter === "REMOVED" ? "selected" : ""}>Removed Members</option></select>${link("pending-members", "Pending requests", "btn secondary compact")}</div><div class="table-wrap"><table><thead><tr><th>Member</th><th>Phone Number</th><th>Membership Status</th><th>Date Joined</th><th>Contribution Position</th><th>Actions</th></tr></thead><tbody>${rows.map((m, i) => `<tr><td><strong>${e(memberName(m))}</strong></td><td>${e(m.phoneNumber || "—")}</td><td>${pill(m.status)}</td><td>${e(formatDate(m.joinedAt))}</td><td>${m.position || i + 1} of ${all.length}</td><td>${link("member-details", "View", "btn secondary compact", idOf(m))}</td></tr>`).join("") || '<tr><td colspan="6">No matching members.</td></tr>'}</tbody></table></div><div class="pagination">Showing ${rows.length ? "1" : "0"}–${rows.length} of ${all.length} members</div></section>`;
 }
 function legacyMemberDetails() {
   const m = (group()?.members || []).find((m) => idOf(m) === routeId);
@@ -2586,7 +2612,8 @@ function paymentReviews() {
   return `${title("Pending Payment Reviews", "Review Member payment submissions and verify their evidence")}<div class="review-summary"><div class="row"><span class="avatar">${icon("payouts")}</span><div><span class="number">${data.reviews.length}</span><p>Pending Reviews</p></div></div><div class="row">${icon("groups")}<div><span class="number">${new Set(data.reviews.map((r) => r.groupName || r.groupId)).size}</span><p>Groups</p></div></div></div><div class="stack">${data.reviews.map((r) => link("payment-review", `${avatar(memberName(r.member))}<div class="grow"><h3>${e(memberName(r.member))}</h3><p>${e(r.groupName || group()?.name)}</p><p>Amount: ${money(r.amount)}</p></div>${pill("UNDER_REVIEW")}${icon("arrow")}`, "review-card", idOf(r))).join("") || empty("No pending payment reviews", "Payment submissions awaiting verification will appear here.")}</div>`;
 }
 function payouts() {
-  return `${title("Payout Schedule")}<a href="#group-details" class="card row" style="color:inherit"><span class="avatar">${icon("groups")}</span><div style="flex:1"><h3>${e(group()?.name || "Savings Group")}</h3><p class="muted small">${preview ? "Cycle 2 , Sep 1 - Sep 30, 2026" : e(data.cycle?.name || "Current cycle")}</p></div>${icon("arrow")}</a><div class="row between"><h3>Payout Order (${data.payouts.length} Members)</h3>${user?.role !== "MEMBER" ? link("payout-order", "Manage Order", "text-btn") : ""}</div><div class="payout-list">${data.payouts.map((p, i) => link("payout-details", `<span class="avatar">${p.position || i + 1}</span><div class="grow"><h3>${e(memberName(p.member))}</h3><p class="muted">${e(formatDate(p.payoutDate))}</p></div><div class="meta">${pill(p.status)}<span>${money(p.amount)}</span></div>${icon("arrow")}`, `payout-card ${p.status === "pending_approval" ? "today" : ""}`, idOf(p))).join("") || empty("No payouts yet", "Payouts will appear when the payout phase begins.")}</div>${user?.role !== "MEMBER" ? button("Trigger Payout Phase", "trigger-payout", "", data.contributions.some((c) => c.status === "CONFIRMED") ? "" : "disabled") : ""}`;
+  const order = data.payoutOrder || [];
+  return `${title("Payout Schedule")}<a href="#group-details" class="card row" style="color:inherit"><span class="avatar">${icon("groups")}</span><div style="flex:1"><h3>${e(group()?.name || "Savings Group")}</h3><p class="muted small">${e(data.cycle?.cycleNumber ? `Cycle ${data.cycle.cycleNumber}` : "No active cycle")}</p></div>${icon("arrow")}</a><div class="row between"><h3>Recipient Order (${order.length} Members)</h3>${user?.role !== "MEMBER" ? link("payout-order", "Manage Order", "text-btn") : ""}</div><div class="payout-list">${order.map((member, i) => `<div class="payout-card"><span class="avatar">${member.position || i + 1}</span><div class="grow"><h3>${e(memberName(member))}</h3><p class="muted">${e(member.role || "member")}</p></div>${pill(member.status)}</div>`).join("") || empty("No payout recipients", "Approved group members will appear in the payout order.")}</div>${data.payouts.length ? `<h3>Payout History</h3><div class="payout-list">${data.payouts.map((p) => link("payout-details", `<div class="grow"><h3>${e(memberName(p.member))}</h3><p class="muted">Cycle ${e(p.cycleNumber)} ? ${e(formatDate(p.payoutDate))}</p></div><div class="meta">${pill(p.status)}<span>${money(p.amount)}</span></div>${icon("arrow")}`, `payout-card ${p.status === "pending_approval" ? "today" : ""}`, idOf(p))).join("")}</div>` : ""}${user?.role !== "MEMBER" ? button("Trigger Payout Phase", "trigger-payout", "", data.cycle?.cycleNumber && data.contributions.some((c) => c.status === "CONFIRMED") ? "" : "disabled") : ""}`;
 }
 function payoutDetails() {
   const p = data.payouts.find((p) => idOf(p) === routeId);
@@ -2604,32 +2631,28 @@ function payoutDetails() {
         "Cycle",
         preview
           ? 'Cycle 2<br><span class="muted small">Sep 1 - Sep 30, 2026</span>'
-          : e(data.cycle?.name),
+           : `Cycle ${e(p.cycleNumber)}`,
       ],
       ["Payout Position", `${p.position} of ${data.payouts.length}`],
     ],
   )}</section><div class="note">${icon("info")}<div><h3>Payout Happens externally</h3><p>Make the payout to the member through your preferred method. Then mark as completed in ThriftCircle</p></div></div>${user?.role !== "MEMBER" && p.status === "pending_approval" ? button("Mark Payout as Completed", "complete-payout", "block", `data-id="${e(idOf(p))}"`) : ""}${link("payouts", "Back to Payout Schedule", "btn secondary block")}</div>`;
 }
 function payoutOrder() {
-  payoutDraft ||= [...data.payouts];
-  return `${title("Payout Order", "Arrange the receiving sequence for your group members.")}<div class="narrow stack">${payoutDraft.map((p, i) => `<div class="payout-card"><span class="avatar">${i + 1}</span><div class="grow"><h3>${e(memberName(p.member))}</h3>${pill(p.status)}</div><div class="row"><button class="icon-btn" aria-label="Move ${e(memberName(p.member))} up" data-action="move-payout" data-index="${i}" data-direction="-1" ${i === 0 || p.status === "completed" || payoutDraft[i - 1]?.status === "completed" ? "disabled" : ""}>${icon("chevrondown", "up")}</button><button class="icon-btn" aria-label="Move ${e(memberName(p.member))} down" data-action="move-payout" data-index="${i}" data-direction="1" ${i === payoutDraft.length - 1 || p.status === "completed" || payoutDraft[i + 1]?.status === "completed" ? "disabled" : ""}>${icon("chevrondown")}</button></div></div>`).join("")}${button("Save Payout Order", "save-payout-order", "block")}${link("payouts", "Cancel", "btn secondary block")}</div>`;
+  payoutDraft ||= [...(data.payoutOrder || [])];
+  return `${title("Payout Order", "Arrange the receiving sequence for your group members.")}<div class="narrow stack">${payoutDraft.map((member, i) => `<div class="payout-card"><span class="avatar">${i + 1}</span><div class="grow"><h3>${e(memberName(member))}</h3><p class="muted">${e(member.phoneNumber || "")}</p></div><div class="row"><button class="icon-btn" aria-label="Move ${e(memberName(member))} up" data-action="move-payout" data-index="${i}" data-direction="-1" ${i === 0 ? "disabled" : ""}>${icon("chevrondown", "up")}</button><button class="icon-btn" aria-label="Move ${e(memberName(member))} down" data-action="move-payout" data-index="${i}" data-direction="1" ${i === payoutDraft.length - 1 ? "disabled" : ""}>${icon("chevrondown")}</button></div></div>`).join("")}${button("Save Payout Order", "save-payout-order", "block")}${link("payouts", "Cancel", "btn secondary block")}</div>`;
 }
 function issues() {
   return `${title("Pending Issues", "View and resolve reported issues.")}<div>${link("report-issue", "Report an Issue", "btn")}</div><div class="stack">${data.issues.map((issue) => link("issue-details", `<div style="flex:1"><h3>${e(issue.title || issue.category || "Payment Issue")}</h3><p>${e(issue.description)}</p></div>${pill(issue.status)}${icon("arrow")}`, "review-card", idOf(issue))).join("") || empty("No pending issues", "Reported group issues will appear here.")}</div>`;
 }
 function reportIssue() {
-  return `${title("Report an Issue")}<form id="report-issue-form" class="narrow stack">${select(
-    "Issue Type",
-    "category",
-    [
-      ["PAYMENT", "Payment Issue"],
-      ["PAYOUT", "Payout Issue"],
-      ["MEMBERSHIP", "Membership Issue"],
-      ["OTHER", "Other"],
-    ],
+  const eligible = data.contributions.filter((c) => c.status === "PENDING_REVIEW");
+  return `${title("Report a Payment Issue", "Report an issue with a contribution awaiting organizer review.")}<form id="report-issue-form" class="narrow stack">${select(
+    "Contribution",
+    "contributionId",
+    [["", "Choose a contribution"], ...eligible.map((c) => [idOf(c), `${memberName(c.member)} ? ${money(c.amount)} ? ${formatDate(c.dueDate || c.paymentDate)}`])],
     "",
     "required",
-  )}${field("Title", "title", "text", "Enter issue title", "", 'required maxlength="100"')}<label class="field"><strong>Description</strong><textarea name="description" placeholder="Describe the issue" required maxlength="2000"></textarea></label>${formError}<button class="btn block">Report Issue</button></form>`;
+  )}<label class="field"><strong>Description</strong><textarea name="description" placeholder="Describe the issue" required maxlength="2000"></textarea></label>${eligible.length ? "" : '<p class="note">There are no contributions awaiting review. The backend only accepts issues for contributions in review.</p>'}${formError}<button class="btn block" ${eligible.length ? "" : "disabled"}>Report Issue</button></form>`;
 }
 function issueDetails() {
   const issue = data.issues.find((i) => idOf(i) === routeId);
@@ -2639,7 +2662,7 @@ function issueDetails() {
       "Select an issue.",
       link("issues", "Pending Issues", "btn"),
     );
-  return `${title("Issue Details")}<div class="card narrow stack"><h2>${e(issue.title)}</h2>${pill(issue.status)}<p>${e(issue.description)}</p>${user?.role !== "MEMBER" && issue.status !== "RESOLVED" ? button("Resolve Issue", "resolve-issue", "", `data-id="${e(idOf(issue))}"`) : ""}</div>`;
+  return `${title("Issue Details")}<div class="card narrow stack"><h2>${e(issue.title || "Payment Issue")}</h2>${pill(issue.status)}<p>${e(issue.description)}</p>${user?.role !== "MEMBER" && issue.status !== "RESOLVED" ? button("Update Issue", "resolve-issue", "", `data-id="${e(idOf(issue))}"`) : ""}</div>`;
 }
 function notifications() {
   return `${title("Activity")}<div>${button("Mark all as read", "read-all", "secondary")}</div><div class="card activity-list">${data.notifications.map((n) => `<div class="list-row">${avatar("Activity")}<div class="grow"><p>${e(n.message || n.title)}</p><small>${e(formatDate(n.createdAt))}</small></div>${n.read || n.isRead ? "" : button("Mark read", "read-notification", "secondary compact", `data-id="${e(idOf(n))}"`)}</div>`).join("") || '<p class="muted">No notifications yet.</p>'}</div>`;
@@ -2695,7 +2718,7 @@ function selectedReceipt(file = evidenceDraft.file) {
 function uploadEvidence() {
   const update = route === "update-submission";
   const c = currentContribution();
-  return `${title(update ? "Update Submission" : "Upload Evidence")}${update ? `<div class="note">${icon("info")}<p>Only update the incorrect field or replace the evidence below. The other details are pre-filled to your original submission.</p></div>` : ""}<section class="stack evidence-summary" style="gap:16px"><h3>${update ? "Contribution Details" : "Contribution Summary"}</h3>${contributionSummary()}</section><form id="evidence-form" class="evidence-layout stack"><h3>Upload Payment Evidence</h3><p class="muted small">Upload a clear screenshot or receipt showing your payment. Supported format: JPEG, PNG, PDF (Max 5MB)</p><input type="hidden" name="paymentDate" value="${e(evidenceDraft.paymentDate || c?.paymentDate || new Date().toISOString().slice(0, 10))}"><input type="hidden" name="reference" value="${e(evidenceDraft.reference || c?.reference || group()?.reference || "")}"><label class="upload-zone" id="receipt-drop-zone">${icon("contrib")}<span class="upload-desktop-label">Drag &amp; drop payment evidence here</span><span class="upload-mobile-label">Upload payment evidence</span><span class="tiny muted">Tap to choose • JPG, PNG or PDF</span><input id="receipt-file" name="receipt" type="file" accept="image/jpeg,image/png,application/pdf" aria-label="Choose payment evidence" ${evidenceDraft.file ? "" : "required"}></label><div id="receipt-container">${selectedReceipt()}</div>${formError}<button class="btn evidence-button" type="submit">${update ? "Continue to Review" : "Upload Evidence"}</button></form>`;
+  return `${title(update ? "Update Submission" : "Upload Evidence")}${update ? `<div class="note">${icon("info")}<p>Only update the incorrect field or replace the evidence below. The other details are pre-filled to your original submission.</p></div>` : ""}<section class="stack evidence-summary" style="gap:16px"><h3>${update ? "Contribution Details" : "Contribution Summary"}</h3>${contributionSummary()}</section><form id="evidence-form" class="evidence-layout stack"><h3>Upload Payment Evidence</h3><p class="muted small">Upload a clear screenshot or receipt showing your payment. Supported format: JPEG, PNG, PDF (Max 5MB)</p><label class="upload-zone" id="receipt-drop-zone">${icon("contrib")}<span class="upload-desktop-label">Drag &amp; drop payment evidence here</span><span class="upload-mobile-label">Upload payment evidence</span><span class="tiny muted">Tap to choose • JPG, PNG or PDF</span><input id="receipt-file" name="file" type="file" accept="image/jpeg,image/png,application/pdf" aria-label="Choose payment evidence" ${evidenceDraft.file ? "" : "required"}></label><div id="receipt-container">${selectedReceipt()}</div>${formError}<button class="btn evidence-button" type="submit">${update ? "Continue to Review" : "Upload Evidence"}</button></form>`;
 }
 function reviewEvidence() {
   const resubmit = route === "review-resubmit";
@@ -2741,7 +2764,7 @@ function contributions() {
   return `${title("Contribution", "Track contribution, verify payments, and manage your group’s progress.")}${cycleBar()}<div class="stat-grid">${stats.map(([label, n, color, description]) => `<div class="stat ${color}"><h3>${n} ${label}</h3><p>${description}</p></div>`).join("")}</div>${contributionTable()}${user?.role !== "MEMBER" ? `<div class="pending-actions">${link("payment-reviews", "Pending Payment Reviews", "btn secondary")}${link("issues", "Pending Issues", "btn secondary")}</div>` : ""}`;
 }
 function memberCard(m) {
-  return `<section class="card member-profile"><div class="row between"><div class="row">${avatar(memberName(m))}<div><h3>${e(memberName(m))}</h3>${pill(m.status === "ACTIVE" ? "Active Member" : "Inactive Member")}</div></div>${route === "member-details" ? link("member-status", "Change Status", "btn compact", idOf(m)) : ""}</div><div class="member-meta"><span>${e(m.phoneNumber || "+234 8123456780")}</span><span>${e(m.email || (preview ? "ada.okafor@gmail.com" : "—"))}</span><span>Contribution Position ${m.position || 1} of ${group()?.memberCount || 10}</span><span>Member since ${e(preview ? "June,2026" : formatDate(m.joinedAt))}</span></div></section>`;
+  return `<section class="card member-profile"><div class="row between"><div class="row">${avatar(memberName(m))}<div><h3>${e(memberName(m))}</h3>${pill(m.status === "ACTIVE" ? "Active Member" : "Inactive Member")}</div></div></div><div class="member-meta"><span>${e(m.phoneNumber || "+234 8123456780")}</span><span>${e(m.email || (preview ? "ada.okafor@gmail.com" : "—"))}</span><span>Contribution Position ${m.position || 1} of ${group()?.memberCount || 10}</span><span>Member since ${e(preview ? "June,2026" : formatDate(m.joinedAt))}</span></div></section>`;
 }
 function memberDetails() {
   const m =
@@ -2764,36 +2787,7 @@ function memberDetails() {
   return `${title("Member Details", "View and manage members details")}${cycleBar()}${memberCard(m)}<section class="card contribution-progress"><div><strong>Contribution Progress</strong><p class="small muted">${e(memberName(m).split(" ")[0])} has contributed ${confirmed} out of ${total} expected payments in this cycle.</p></div><div><strong>${percentage}%</strong><progress max="100" value="${percentage}" aria-label="Contribution progress">${percentage}%</progress></div></section>${contributionTable(idOf(m))}`;
 }
 function memberStatus() {
-  const m =
-    (group()?.members || []).find((m) => idOf(m) === routeId) ||
-    group()?.members?.[0];
-  if (!m)
-    return empty(
-      "Member not found",
-      "Choose a member.",
-      link("members", "Member List", "btn"),
-    );
-  selectedMemberStatus =
-    activeScreen?.state === "inactive" ? "INACTIVE" : m.status || "ACTIVE";
-  return `${title("Member Status", `Manage the membership status for ${memberName(m)}`)}${cycleBar()}${memberCard(m)}<form id="member-status-form" class="stack"><input type="hidden" name="memberId" value="${e(idOf(m))}"><h3>Change Membership Status</h3><p>Update the member’s status in the group. This will affect their access to the group and future contributions.</p><div class="membership-choices">${[
-    [
-      "ACTIVE",
-      "Active",
-      "The member can continue to make contributions and participate in the group.",
-    ],
-    [
-      "INACTIVE",
-      "Inactive",
-      "The member will be temporarily removed from the group and cannot make contributions until reactivated.",
-    ],
-  ]
-    .map(
-      ([value, label, description]) =>
-        `<label><input type="radio" name="status" value="${value}" ${selectedMemberStatus === value ? "checked" : ""}><span><strong>${label}</strong><small>${description}</small></span></label>`,
-    )
-    .join(
-      "",
-    )}</div><div class="note">${icon("info")}<div><p>What happens when you change the status?</p><small>The member’s membership record will be updated.</small></div></div>${formError}<div class="grid"><button type="submit" class="btn">Continue</button>${link("member-details", "Cancel", "btn secondary", idOf(m))}</div></form>`;
+  return empty("Membership status changes are unavailable", "The backend supports approving or rejecting pending join requests, but it does not expose an endpoint for changing an active member?s status.", link("members", "Back to Members", "btn"));
 }
 function paymentReview() {
   const r =
@@ -2834,21 +2828,17 @@ function contributionStatus() {
   return `${title("Contribution Status")}<div class="narrow stack">${contributionSummary(c?.status)}<div class="note">${icon("info")}<p>${c?.status === "CONFIRMED" ? "Your payment has been confirmed." : c?.status === "UNDER_REVIEW" ? "Your payment evidence is awaiting organizer review." : "View your contribution details or record your payment."}</p></div>${link("contribution-details", "View Contribution Details", "btn block", idOf(c))}${/CORRECTION|ISSUE/.test(c?.status || "") ? link("correction-required", "View Feedback", "btn secondary block") : ""}</div>`;
 }
 function confirmIssue() {
-  const issue = data.issues.find((i) => idOf(i) === routeId);
-  return `${title("Add/Confirm Reason")}<form id="confirm-issue-form" class="narrow stack"><section class="card stack"><h3>Reason for issues</h3>${select(
-    "Reason",
-    "category",
-    [
-      ["INCORRECT_AMOUNT", "Incorrect payment amount"],
-      ["INCORRECT_CYCLE", "Incorrect cycle"],
-      ["UNCLEAR_EVIDENCE", "Unclear payment evidence"],
-      ["OTHER", "Other"],
-    ],
-    issue?.category || "",
-  )}<label class="field"><strong>Add a reason</strong><textarea name="description" required placeholder="Explain what needs to be corrected">${e(issue?.description)}</textarea></label></section>${formError}<div class="grid">${link("issues", "Cancel", "btn secondary")}<button class="btn" type="submit">Confirm</button></div></form>`;
+  const eligible = data.contributions.filter((c) => c.status === "PENDING_REVIEW");
+  return `${title("Report a Payment Issue")}<form id="confirm-issue-form" class="narrow stack">${select(
+    "Contribution",
+    "contributionId",
+    [["", "Choose a contribution"], ...eligible.map((c) => [idOf(c), `${memberName(c.member)} ? ${money(c.amount)}`])],
+    "",
+    "required",
+  )}<label class="field"><strong>Description</strong><textarea name="description" required placeholder="Describe the payment issue"></textarea></label>${formError}<button class="btn" ${eligible.length ? "" : "disabled"}>Report Issue</button></form>`;
 }
 function issueReported() {
-  return `<div class="success-screen">${icon("check")}${title("Issue reported", "The organizer has been notified. You can track this issue from Pending Issues.")}${link("issues", "Back to Pending Issues", "btn")}</div>`;
+  return `<div class="success-screen">${icon("check")}${title("Issue reported", "The organizer has been notified.")}${link("dashboard", "Back to Dashboard", "btn")}</div>`;
 }
 function splash() {
   return `<section class="splash-screen">${logo}${link("welcome", "Continue", "btn")}</section>`;
@@ -2860,7 +2850,7 @@ function passwordUpdated() {
   );
 }
 function inactiveDashboard() {
-  return `${title("Good morning, Opeyemi", "Here is what’s happening with your savings group.")}<section class="inactive-cycle">${icon("calendar")}<h2>No Active Cycle</h2><p>You don’t have an active cycle right now. Create a new cycle to start collecting contributions</p>${button("Create new cycle", "new-cycle")}</section><section class="card stack"><h3>Quick Actions</h3>${link("members", "Manage Members", "list-row")}${link("groups", "View Groups", "list-row")}${link("group-settings", "Group Settings", "list-row")}</section>`;
+  return `${title("Good morning, Opeyemi", "Here is what?s happening with your savings group.")}<section class="inactive-cycle">${icon("calendar")}<h2>No Active Cycle</h2><p>A cycle starts automatically on the group?s scheduled contribution date.</p></section><section class="card stack"><h3>Quick Actions</h3>${link("members", "Manage Members", "list-row")}${link("groups", "View Groups", "list-row")}${link("group-settings", "Group Settings", "list-row")}</section>`;
 }
 function groupSettings() {
   const g = group();
@@ -2877,7 +2867,7 @@ function settings() {
   return `${title("Settings")}<section class="card narrow stack"><h3>Account</h3>${link("profile", "View Profile", "btn secondary")}${link("forgot-password", "Reset Password", "btn secondary")}${link("support", "Help & Support", "btn secondary")}${button("Log Out", "logout", "secondary")}</section>`;
 }
 function support() {
-  return `${title("Help & Support")}<section class="card narrow stack"><h3>Payment and group issues</h3><p>Report an issue with a contribution, payout, or group membership.</p>${link("report-issue", "Report an Issue", "btn")}${link("issues", "View Reported Issues", "btn secondary")}</section>`;
+  return `${title("Help & Support")}<section class="card narrow stack"><h3>Payment and group issues</h3><p>Report an issue with a contribution, payout, or group membership.</p>${link("report-issue", "Report an Issue", "btn")}${user?.role !== "MEMBER" ? link("issues", "View Reported Issues", "btn secondary") : ""}</section>`;
 }
 function screensIndex() {
   const sections = [...new Set(screenCatalog.map((item) => item.section))];
@@ -2961,14 +2951,6 @@ function render() {
     document.body.classList.add(
       activeScreen.width < 700 ? "catalog-mobile" : "catalog-desktop",
     );
-    if (route === "change-member-status" && activeScreen.state === "default")
-      modal(
-        "Change Membership Status",
-        "You are about to change Ada Okafor’s status from Active to Inactive.",
-        "commit-member-status",
-        routeId,
-        '<div class="note"><p>This will remove them from the group temporarily and prevent them from making contributions.</p></div><input type="hidden" name="nextStatus" value="INACTIVE">',
-      );
     if (route === "confirm-payment" && activeScreen.state === "default")
       modal(
         "Confirm Payment",
@@ -3113,6 +3095,10 @@ async function loadPage() {
     go("login");
     return;
   }
+  if (user?.role === "MEMBER" && ["issues", "issue-details", "confirm-issue"].includes(route)) {
+    go("dashboard");
+    return;
+  }
   if (
     user?.role === "MEMBER" &&
     [
@@ -3149,7 +3135,7 @@ async function loadPage() {
   );
   try {
     if (!ready) {
-      data.groups = listOf(await api.myGroups(), "groups");
+      data.groups = listOf(await api.myGroups(), "groups").map(normalizeGroup);
       ready = true;
     }
     if (stamp !== requestVersion) return;
@@ -3161,7 +3147,7 @@ async function loadPage() {
       groupId &&
       !["groups", "join-group", "profile", "notifications"].includes(route)
     ) {
-      const fullGroup = unwrap(await api.group(groupId));
+      const fullGroup = normalizeGroup(await api.group(groupId));
       data.groups = data.groups.map((g) =>
         idOf(g) === groupId ? { ...g, ...fullGroup } : g,
       );
@@ -3183,12 +3169,15 @@ async function loadPage() {
           "contribution-status",
           "outstanding-contribution",
           "review-resubmit",
+          "report-issue",
         ].includes(route)
       )
-        data.contributions = listOf(
-          await api.contributions(groupId),
-          "contributions",
-        );
+        data.contributions = listOf(await api.contributions(groupId), "contributions")
+          .map(normalizeContribution)
+          .map((c) => ({
+            ...c,
+            member: group()?.members?.find((m) => idOf(m) === idOf(c.member)) || c.member,
+          }));
       if (
         [
           "dashboard",
@@ -3199,33 +3188,66 @@ async function loadPage() {
           "payout-details",
         ].includes(route)
       )
-        data.cycle = unwrap(await api.currentCycle(groupId)) || {};
+        data.cycle = await api.currentCycle(groupId).then(unwrap).catch((error) => {
+          if (error.status === 404) return null;
+          throw error;
+        });
       if (route === "dashboard")
-        data.dashboard =
-          unwrap(
-            await (user.role === "MEMBER"
-              ? api.memberDashboard(groupId)
-              : api.organizerDashboard(groupId)),
-          ) || {};
+        data.dashboard = unwrap(
+          await (user.role === "MEMBER"
+            ? api.memberDashboard(groupId)
+            : api.organizerDashboard(groupId)),
+        ) || {};
+      if (user.role === "MEMBER" && route === "dashboard") {
+        const current = data.dashboard.currentContribution;
+        if (current) {
+          const normalized = normalizeContribution(current);
+          data.contributions = [
+            normalized,
+            ...data.contributions.filter((c) => idOf(c) !== idOf(normalized)),
+          ];
+          data.cycle = { ...(data.cycle || {}), dueDate: normalized.dueDate, cycleNumber: normalized.cycleNumber };
+        }
+      }
+      if (route === "dashboard" && user.role !== "MEMBER") {
+        const d = data.dashboard;
+        data.dashboard = {
+          ...d,
+          confirmed: data.contributions.filter((c) => c.status === "CONFIRMED").length,
+          pending: data.contributions.filter((c) => c.status === "PENDING_REVIEW").length,
+          overdue: data.contributions.filter((c) => c.status === "OVERDUE").length,
+          totalMembers: d.memberCount,
+        };
+      }
+      if (["group-details", "group-settings"].includes(route))
+        data.rules = unwrap(await api.groupRules(groupId)) || {};
       if (route === "pending-members")
-        data.pending = listOf(await api.pendingMembers(groupId), "members");
+        data.pending = listOf(await api.pendingMembers(groupId), "members").map(normalizeMember);
       if (["payouts", "payout-details", "payout-order"].includes(route))
-        data.payouts = listOf(await api.payouts(groupId), "payouts");
+        data.payouts = listOf(await api.payouts(groupId), "payouts").map((p) => {
+          const recipient = group()?.members?.find((m) => idOf(m) === idOf(p.recipientId));
+          return { ...p, id: idOf(p), member: recipient || p.recipientId, position: recipient?.position, payoutDate: p.updatedAt || p.createdAt };
+        });
+      if (["payouts", "payout-order"].includes(route))
+        data.payoutOrder = [...(group()?.members || [])].sort((a, b) => (a.position || 999) - (b.position || 999));
       if (["issues", "issue-details"].includes(route))
         data.issues = listOf(await api.issues(groupId), "issues");
       if (route === "contribution-details" && routeId) {
-        const c = unwrap(await api.contribution(routeId));
+        const c = normalizeContribution(await api.contribution(routeId));
         data.contributions = [
           ...data.contributions.filter((x) => idOf(x) !== routeId),
           c,
         ];
       }
-      if (["payment-reviews", "payment-review"].includes(route))
-        data.reviews = data.contributions.filter((c) =>
-          ["UNDER_REVIEW", "PENDING", "pending", "under_review"].includes(
-            c.status,
-          ),
-        );
+      if (["payment-reviews", "payment-review"].includes(route)) {
+        const pending = data.contributions.filter((c) => c.status === "PENDING_REVIEW");
+        data.reviews = await Promise.all(pending.map(async (c) => {
+          const detail = normalizeContribution(await api.contribution(idOf(c)));
+          const evidence = (detail.evidence || []).find((item) => item.reviewStatus === "PENDING") || detail.evidence?.[0];
+          const member = group()?.members?.find((m) => idOf(m) === idOf(detail.member));
+          return { ...detail, member, evidenceId: idOf(evidence), evidence: evidence ? { ...evidence, url: evidence.fileUrl, name: evidence.fileUrl?.split("/").pop() } : null };
+        }));
+      }
     }
     if (["dashboard", "notifications"].includes(route))
       data.notifications = listOf(await api.notifications(), "notifications");
@@ -3271,6 +3293,8 @@ function rememberUser(response) {
   if (!token || !u)
     throw new Error("The server did not return an access token and user.");
   sessionStorage.setItem("thriftcircle.token", token);
+  if (r?.refreshToken)
+    sessionStorage.setItem("thriftcircle.refreshToken", r.refreshToken);
   user = u;
   sessionStorage.setItem("thriftcircle.user", JSON.stringify(u));
   ready = false;
@@ -3306,7 +3330,9 @@ document.addEventListener("submit", async (event) => {
           else
             rememberUser(
               await api.login({
-                email: values.email,
+                ...(values.loginIdentifier.includes("@")
+                  ? { email: values.loginIdentifier.trim() }
+                  : { phoneNumber: values.loginIdentifier.trim() }),
                 password: values.password,
               }),
             );
@@ -3353,27 +3379,28 @@ document.addEventListener("submit", async (event) => {
           preview
             ? Promise.resolve()
             : api.forgotPassword({ email: values.email }),
-        () =>
-          modal(
-            "Check your email",
-            "If an account exists for this email, a password reset link has been sent.",
-          ),
+        () => {
+          resetEmail = values.email;
+          sessionStorage.setItem("thriftcircle.resetEmail", resetEmail);
+          go("reset-password");
+        },
         target,
       );
       return;
     }
     if (form.id === "reset-form") {
-      const token = query.get("token");
-      if (!preview && !token)
-        throw new Error(
-          "Open the reset link from your email before setting a new password.",
-        );
       await runMutation(
         () =>
           preview
             ? Promise.resolve()
-            : api.resetPassword({ token, password: values.password }),
+            : api.resetPassword({
+                email: values.email,
+                resetCode: values.resetCode,
+                newPassword: values.password,
+              }),
         () => {
+          sessionStorage.removeItem("thriftcircle.resetEmail");
+          resetEmail = "";
           notify("Password updated successfully.");
           go("login");
         },
@@ -3403,43 +3430,28 @@ document.addEventListener("submit", async (event) => {
       groupDraft = {
         ...groupDraft,
         ...values,
-        latePaymentDays: Number(values.latePaymentDays),
+        gracePeriodDays: Number(values.gracePeriodDays),
+        allowLateSubmission: values.allowLateSubmission === "true",
       };
-      go("payout-configuration");
-      return;
-    }
-    if (form.id === "payout-config-form") {
-      groupDraft = { ...groupDraft, ...values };
       go("review-group");
       return;
     }
     if (form.id === "review-group-form") {
-      if (!groupDraft.name || !groupDraft.contributionAmount)
-        throw new Error(
-          "Complete the group details and contribution setup first.",
-        );
+      if (!groupDraft.name || !groupDraft.contributionAmount || !groupDraft.frequency || !groupDraft.startDate || !groupDraft.contributionDeadline)
+        throw new Error("Group name, contribution amount, frequency, start date, and contribution deadline are required.");
       await runMutation(
         async () => {
           const payload = {
             groupName: groupDraft.name,
-            description: groupDraft.description,
-            memberCount: groupDraft.memberCount,
-            type: groupDraft.type,
             contributionAmount: groupDraft.contributionAmount,
-            frequency: groupDraft.frequency,
+            frequency: groupDraft.frequency.toLowerCase(),
             startDate: groupDraft.startDate,
             contributionDeadline: groupDraft.contributionDeadline,
-            payoutMethod: groupDraft.payoutMethod,
-            rules: {
-              latePaymentDays: groupDraft.latePaymentDays,
-              missedContributions: groupDraft.missedContributions,
-              leavingGroup: groupDraft.leavingGroup,
-              customRules: groupDraft.customRules,
-            },
           };
-          const g = preview
+          let g = preview
             ? {
                 ...payload,
+                name: payload.groupName,
                 id: `group-${Date.now()}`,
                 inviteCode: Math.random()
                   .toString(36)
@@ -3448,10 +3460,26 @@ document.addEventListener("submit", async (event) => {
                 status: "ACTIVE",
                 members: [],
               }
-            : unwrap(await api.createGroup(payload));
+            : groupDraft.createdGroupId
+              ? normalizeGroup(await api.group(groupDraft.createdGroupId))
+              : normalizeGroup(await api.createGroup(payload));
           if (!idOf(g))
             throw new Error("The server did not return the created group ID.");
-          data.groups.push(g);
+          if (!preview && !groupDraft.createdGroupId) {
+            groupDraft.createdGroupId = idOf(g);
+            groupId = idOf(g);
+            data.groups = [...data.groups.filter((item) => idOf(item) !== groupId), g];
+          }
+          if (!preview && !groupDraft.rulesSaved) {
+            await api.updateGroupRules(idOf(g), {
+              gracePeriodDays: groupDraft.gracePeriodDays ?? 0,
+              allowLateSubmission: groupDraft.allowLateSubmission ?? true,
+              maxMembers: Number(groupDraft.memberCount) || null,
+            });
+            groupDraft.rulesSaved = true;
+          }
+          g = normalizeGroup(g);
+          data.groups = [...data.groups.filter((item) => idOf(item) !== idOf(g)), g];
           groupId = idOf(g);
         },
         () => go("group-created"),
@@ -3497,26 +3525,12 @@ document.addEventListener("submit", async (event) => {
         throw new Error("Upload your payment evidence first.");
       await runMutation(
         async () => {
-          let c = currentContribution();
+          const c = currentContribution();
+          if (!c) throw new Error("No outstanding contribution was found for this group.");
           if (!preview) {
-            if (!evidenceDraft.recordedId) {
-              const recorded = unwrap(
-                await api.recordContribution(groupId, {
-                  amount: Number(c?.amount || group()?.contributionAmount),
-                  paymentDate: evidenceDraft.paymentDate,
-                  reference: evidenceDraft.reference,
-                }),
-              );
-              evidenceDraft.recordedId = idOf(recorded);
-            }
-            const cid = evidenceDraft.recordedId;
-            if (!cid)
-              throw new Error(
-                "The server did not return the recorded contribution ID.",
-              );
             const body = new FormData();
-            body.append(config.evidenceField || "receipt", evidenceDraft.file);
-            await api.uploadEvidence(cid, body);
+            body.append(config.evidenceField || "file", evidenceDraft.file);
+            await api.uploadEvidence(idOf(c), body);
           } else if (c) {
             c.status = "UNDER_REVIEW";
             c.paymentDate = evidenceDraft.paymentDate;
@@ -3539,10 +3553,8 @@ document.addEventListener("submit", async (event) => {
       await runMutation(
         async () => {
           const payload = {
-            groupId,
-            category: values.category,
-            title: values.title,
-            description: values.description,
+            contributionId: values.contributionId,
+            description: values.description.trim(),
           };
           if (preview)
             data.issues.push({
@@ -3554,7 +3566,7 @@ document.addEventListener("submit", async (event) => {
         },
         () => {
           notify("Issue reported.");
-          go("issues");
+          go(user?.role === "MEMBER" ? "dashboard" : "issues");
         },
         target,
       );
@@ -3641,11 +3653,17 @@ document.addEventListener("click", async (event) => {
   }
   if (action === "logout") {
     await runMutation(
-      () => (preview ? Promise.resolve() : api.logout()),
+      () =>
+        preview
+          ? Promise.resolve()
+          : api.logout({
+              refreshToken: sessionStorage.getItem("thriftcircle.refreshToken"),
+            }),
       () => {
         user = null;
         ready = false;
         sessionStorage.removeItem("thriftcircle.token");
+        sessionStorage.removeItem("thriftcircle.refreshToken");
         sessionStorage.removeItem("thriftcircle.user");
         go("welcome");
       },
@@ -3729,8 +3747,8 @@ document.addEventListener("click", async (event) => {
           data.reviews = data.reviews.filter((r) => idOf(r) !== id);
         } else
           await api.reviewEvidence(evidenceId, {
-            status: approved ? "APPROVED" : "REJECTED",
-            reason: feedback,
+            decision: approved ? "APPROVED" : "REJECTED",
+            reviewNote: feedback,
           });
       },
       () => {
@@ -3754,7 +3772,11 @@ document.addEventListener("click", async (event) => {
     await runMutation(
       async () => {
         if (preview) data.cycle.status = "PAYOUT_PHASE";
-        else await api.triggerPayout(groupId);
+        else {
+          if (!data.cycle?.cycleNumber)
+            throw new Error("There is no active cycle to pay out yet.");
+          await api.triggerPayout(groupId, data.cycle.cycleNumber);
+        }
       },
       () => {
         dialog.close();
@@ -3771,22 +3793,15 @@ document.addEventListener("click", async (event) => {
       "Confirm that the payout has already been disbursed outside ThriftCircle.",
       "commit-complete-payout",
       id,
-      field(
-        "Transaction Notes",
-        "transactionNotes",
-        "text",
-        "Add payout transaction notes",
-      ),
     );
     return;
   }
   if (action === "commit-complete-payout") {
-    const notes = dialog.querySelector("[name=transactionNotes]").value;
     await runMutation(
       async () => {
         if (preview)
           data.payouts.find((p) => idOf(p) === id).status = "completed";
-        else await api.approvePayout(id, notes);
+        else await api.approvePayout(id);
       },
       () => {
         dialog.close();
@@ -3813,13 +3828,13 @@ document.addEventListener("click", async (event) => {
   if (action === "save-payout-order") {
     await runMutation(
       async () => {
-        const order = payoutDraft.map((p, i) => ({
-          position: i + 1,
-          memberId: idOf(p.member || p.memberId),
+        const order = payoutDraft.map((member, i) => ({
+          userId: idOf(member),
+          payoutOrder: i + 1,
         }));
-        validatePayoutOrder(data.payouts, order);
+        validatePayoutOrder(data.payoutOrder, order);
         if (preview)
-          data.payouts = payoutDraft.map((p, i) => ({ ...p, position: i + 1 }));
+          data.payoutOrder = payoutDraft.map((member, i) => ({ ...member, position: i + 1 }));
         else await api.reorderPayouts(groupId, order);
       },
       () => {
@@ -3832,25 +3847,30 @@ document.addEventListener("click", async (event) => {
   }
   if (action === "resolve-issue") {
     modal(
-      "Resolve Issue",
-      "Confirm that this issue has been resolved.",
+      "Update Issue",
+      "An issue remains open until corrected evidence is approved. Choose the next review status.",
       "commit-resolve-issue",
       id,
-      field("Resolution", "resolution", "text", "Enter resolution notes"),
+      `${select("Next Status", "status", [["UNDER_REVIEW", "Under review"], ["CORRECTION_REQUIRED", "Request correction"]], "UNDER_REVIEW", "required")}${field("Resolution Note", "resolutionNote", "text", "Explain the next step")}`,
     );
     return;
   }
   if (action === "commit-resolve-issue") {
-    const resolution = dialog.querySelector("[name=resolution]").value;
+    const status = dialog.querySelector("[name=status]").value;
+    const resolutionNote = dialog.querySelector("[name=resolutionNote]").value.trim();
+    if (status === "CORRECTION_REQUIRED" && !resolutionNote) {
+      dialog.querySelector(".form-error").textContent = "Add a resolution note when requesting a correction.";
+      return;
+    }
     await runMutation(
       async () => {
         if (preview)
           data.issues.find((i) => idOf(i) === id).status = "RESOLVED";
-        else await api.resolveIssue(id, { resolution });
+        else await api.resolveIssue(id, { status, resolutionNote });
       },
       () => {
         dialog.close();
-        notify("Issue resolved.");
+        notify("Issue updated.");
         go("issues");
       },
       target,
@@ -3939,31 +3959,12 @@ document.addEventListener("submit", async (event) => {
   if (!form.reportValidity()) return;
   const values = Object.fromEntries(new FormData(form));
   const target = form.querySelector("button[type=submit]");
-  if (form.id === "member-status-form") {
-    const member = (group()?.members || []).find(
-      (m) => idOf(m) === values.memberId,
-    );
-    if (!member) return;
-    if (member.status === values.status) {
-      notify("Choose a different membership status.");
-      return;
-    }
-    modal(
-      "Change Membership Status",
-      `You are about to change ${memberName(member)}’s status from ${member.status === "ACTIVE" ? "Active" : "Inactive"} to ${values.status === "ACTIVE" ? "Active" : "Inactive"}.`,
-      "commit-member-status",
-      idOf(member),
-      `<div class="note"><p>${values.status === "INACTIVE" ? "Remove them from the group temporarily. Prevent them from making contributions." : "Restore their participation in the group."}</p></div><input type="hidden" name="nextStatus" value="${e(values.status)}">`,
-    );
-  }
   if (form.id === "confirm-issue-form") {
     await runMutation(
       async () => {
         const payload = {
-          groupId,
-          category: values.category,
-          description: values.description,
-          title: "Payment Issue",
+          contributionId: values.contributionId,
+          description: values.description.trim(),
         };
         if (preview)
           data.issues.push({
@@ -3998,83 +3999,6 @@ document.addEventListener("click", async (event) => {
       URL.revokeObjectURL(receiptUrl);
     receiptUrl = "";
     go(uploadedReturnRoute);
-    return;
-  }
-  if (action === "commit-member-status") {
-    const status = dialog.querySelector("[name=nextStatus]").value;
-    await runMutation(
-      async () => {
-        if (preview) {
-          const member = group().members.find((m) => idOf(m) === id);
-          if (member) member.status = status;
-        } else {
-          if (!config.memberStatusPath)
-            throw new Error(
-              "The backend has not supplied a membership-status endpoint yet. No change was saved.",
-            );
-          const endpoint = config.memberStatusPath
-            .replace(":groupId", encodeURIComponent(groupId))
-            .replace(":userId", encodeURIComponent(id));
-          await api.request(endpoint, { method: "PATCH", body: { status } });
-        }
-      },
-      () => {
-        dialog.close();
-        notify("Status updated successfully.");
-        go("member-details", id);
-      },
-      target,
-    );
-    return;
-  }
-  if (action === "new-cycle") {
-    modal(
-      "Create New Cycle",
-      "Choose the start date for the next contribution cycle.",
-      "commit-new-cycle",
-      "",
-      field(
-        "Start Date",
-        "startDate",
-        "date",
-        "",
-        new Date().toISOString().slice(0, 10),
-        "required",
-      ),
-    );
-    return;
-  }
-  if (action === "commit-new-cycle") {
-    const date = dialog.querySelector("[name=startDate]").value;
-    if (!date) {
-      dialog.querySelector(".form-error").textContent = "Choose a start date.";
-      return;
-    }
-    await runMutation(
-      async () => {
-        if (preview)
-          data.cycle = { ...data.cycle, status: "ACTIVE", startDate: date };
-        else {
-          if (!config.createCyclePath)
-            throw new Error(
-              "The backend has not supplied a cycle-creation endpoint yet. No cycle was created.",
-            );
-          await api.request(
-            config.createCyclePath.replace(
-              ":groupId",
-              encodeURIComponent(groupId),
-            ),
-            { method: "POST", body: { startDate: date } },
-          );
-        }
-      },
-      () => {
-        dialog.close();
-        activeScreen = null;
-        go("dashboard");
-      },
-      target,
-    );
     return;
   }
   if (action === "view-evidence") {
